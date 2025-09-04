@@ -37,16 +37,6 @@ extern "C" {
  *
  * Strings MAY be:
  * * Empty
- *
- * The below fields map to usual datadog attributes as follows (TODO: Remove this once we share the header publicly)
- * * deployment_environment_name -> env
- * * host_name -> hostname
- * * service_instance_id -> runtime-id
- * * service_name -> service
- * * service_version -> version
- * * telemetry_sdk_language -> tracer_language
- * * telemetry_sdk_version -> tracer_version
- * * telemetry_sdk_name -> name of library (e.g. dd-trace-java)
  */
 typedef struct {
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/deployment/#deployment-environment-name
