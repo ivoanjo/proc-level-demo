@@ -50,7 +50,7 @@ static const otel_process_ctx_data empty_data = {
     return (otel_process_ctx_result) {.success = false, .error_message = "OTEL_PROCESS_CTX_NOOP mode is enabled - no-op implementation (" __FILE__ ":" ADD_QUOTES(__LINE__) ")"};
   }
 
-  bool otel_process_ctx_drop(void) {
+  bool otel_process_ctx_drop_current(void) {
     return true; // Nothing to do, this always succeeds
   }
 
@@ -105,7 +105,7 @@ static otel_process_ctx_state published_state;
 
 static otel_process_ctx_result otel_process_ctx_encode_payload(char **out, uint32_t *out_size, otel_process_ctx_data data);
 
-// We use a mapping size of 3 pages explicitly as a hint when running on legacy kernels that don't support the
+// We use a mapping size of 2 pages explicitly as a hint when running on legacy kernels that don't support the
 // PR_SET_VMA_ANON_NAME prctl call; see below for more details.
 static long size_for_mapping(void) {
   long page_size_bytes = sysconf(_SC_PAGESIZE);
@@ -214,7 +214,7 @@ bool otel_process_ctx_drop_current(void) {
   // (due to the MADV_DONTFORK) and we don't need to do anything to it.
   if (state.mapping != NULL && state.mapping != MAP_FAILED && getpid() == state.publisher_pid) {
     long mapping_size = size_for_mapping();
-    if (mapping_size == -1 || munmap(published_state.mapping, mapping_size) == -1) return false;
+    if (mapping_size == -1 || munmap(state.mapping, mapping_size) == -1) return false;
   }
 
   // The payload may have been inherited from a parent. This is a regular malloc so we need to free it so we don't leak.
@@ -327,6 +327,7 @@ static otel_process_ctx_result otel_process_ctx_encode_payload(char **out, uint3
 }
 
 #ifndef OTEL_PROCESS_CTX_NO_READ
+  #include <inttypes.h>
   #include <limits.h>
   #include <sys/uio.h>
   #include <sys/utsname.h>
@@ -357,6 +358,12 @@ static otel_process_ctx_result otel_process_ctx_encode_payload(char **out, uint3
 
     // Validate expected permission
     if (strstr(line, " r--p ") == NULL) return false;
+
+    // Validate expected context size
+    int64_t start, end;
+    if (sscanf(line, "%" PRIx64 "-%" PRIx64, &start, &end) != 2) return false;
+    if (start == 0 || end == 0 || end <= start) return false;
+    if ((end - start) != size_for_mapping()) return false;
 
     if (named_mapping_supported()) {
       // On Linux 5.17+, check if the line ends with [anon:OTEL_CTX]

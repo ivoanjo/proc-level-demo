@@ -95,10 +95,14 @@ target_include_directories(otel_process_ctx_cpp_noop_static PUBLIC ${CMAKE_CURRE
 add_executable(example_ctx example_ctx.c)
 target_link_libraries(example_ctx otel_process_ctx)
 
+# Create example noop executable
+add_executable(example_ctx_noop example_ctx.c)
+target_link_libraries(example_ctx_noop otel_process_ctx_noop)
+
 # Install rules
 install(TARGETS otel_process_ctx otel_process_ctx_static otel_process_ctx_noop otel_process_ctx_noop_static
                 otel_process_ctx_cpp otel_process_ctx_cpp_static otel_process_ctx_cpp_noop otel_process_ctx_cpp_noop_static
-                example_ctx
+                example_ctx example_ctx_noop
     LIBRARY DESTINATION lib
     ARCHIVE DESTINATION lib
     RUNTIME DESTINATION bin
