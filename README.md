@@ -12,8 +12,6 @@ Specifically:
 
 * `ebpf-program` shows how it's possible to hook on prctl if we optionally want to observe context publish/update events (instead of polling)
 
-* `original-poc` is an older version of the ideas above, kept for archival reasons
-
 * See also:
     * https://github.com/DataDog/dd-otel-host-profiler/pull/210 Reading process-level data on Datadog's fork of the OTEL profiler
     * Integration of `anonmapping-clib` into [dd-trace-java](https://github.com/DataDog/java-profiler/pull/266) and [dd-trace-rb](https://github.com/DataDog/dd-trace-rb/pull/4865)
