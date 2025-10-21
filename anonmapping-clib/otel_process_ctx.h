@@ -18,7 +18,8 @@ extern "C" {
  * # OpenTelemetry Process Context reference implementation
  *
  * `otel_process_ctx.h` and `otel_process_ctx.c` provide a reference implementation for the OpenTelemetry
- * process-level context sharing specification. (TODO Link)
+ * process-level context sharing specification.
+ * (https://docs.google.com/document/d/1-4jo29vWBZZ0nKKAOG13uAQjRcARwmRc4P313LTbPOE/edit?tab=t.0#heading=h.apoktm599bj5)
  *
  * This reference implementation is Linux-only, as the specification currently only covers Linux.
  * On non-Linux OS's (or when OTEL_PROCESS_CTX_NOOP is defined) no-op versions of functions are supplied.

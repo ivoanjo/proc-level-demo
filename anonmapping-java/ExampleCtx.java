@@ -4,6 +4,7 @@
 import java.lang.foreign.*;
 import java.lang.invoke.MethodHandle;
 import java.nio.charset.StandardCharsets;
+import java.time.Instant;
 import java.util.Map;
 
 import static java.lang.foreign.ValueLayout.*;
@@ -252,10 +253,17 @@ class OtelProcessCtx {
 
             // Step: Populate the mapping
             // The payload and any extra fields must come first and not be reordered with the signature by the compiler.
+
+            // Get current time in nanoseconds since epoch
+            Instant now = Instant.now();
+            long publishedAtNs = now.getEpochSecond() * 1_000_000_000L + now.getNano();
+
             mapping.set(ADDRESS, 0, MemorySegment.NULL); // signature placeholder
             mapping.set(JAVA_INT, 8, OTEL_CTX_VERSION);
-            mapping.set(JAVA_INT, 12, payloadResult.length);
-            mapping.set(ADDRESS, 16, payloadSegment);
+            // Use unaligned long since offset 12 is not 8-byte aligned (C struct is packed)
+            mapping.set(JAVA_LONG_UNALIGNED, 12, publishedAtNs);
+            mapping.set(JAVA_INT, 20, payloadResult.length);
+            mapping.set(ADDRESS, 24, payloadSegment);
 
             // Step: Synchronization - Mapping has been filled and is missing signature
             // Make sure the initialization of the mapping + payload above does not get reordered with setting the signature below.

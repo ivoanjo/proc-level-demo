@@ -20,6 +20,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <time.h>
 #include <unistd.h>
 
 #define ADD_QUOTES_HELPER(x) #x
@@ -73,13 +74,11 @@ static const otel_process_ctx_data empty_data = {
  * An outside-of-process reader will read this struct + otel_process_payload to get the data.
  */
 typedef struct __attribute__((packed, aligned(8))) {
-  char otel_process_ctx_signature[8]; // Always "OTEL_CTX"
-  // TODO: Is version useful? Should we just get rid of it?
-  uint32_t otel_process_ctx_version;  // Always > 0, incremented when the data structure changes
-  // TODO: Is size useful? Should we just get rid of it?
-  uint32_t otel_process_payload_size; // Always > 0, size of storage
-  // TODO: Should we just inline the data in the mapping itself?
-  char *otel_process_payload;         // Always non-null, points to the storage for the data; expected to be a msgpack map of string key/value pairs, null-terminated
+  char otel_process_ctx_signature[8];        // Always "OTEL_CTX"
+  uint32_t otel_process_ctx_version;         // Always > 0, incremented when the data structure changes, currently v2
+  uint64_t otel_process_ctx_published_at_ns; // Always > 0, timestamp from when the context was published in nanoseconds since epoch
+  uint32_t otel_process_payload_size;        // Always > 0, size of storage
+  char *otel_process_payload;                // Always non-null, points to the storage for the data; expected to be a protobuf map of string key/value pairs, null-terminated
 } otel_process_ctx_mapping;
 
 /**
@@ -114,6 +113,14 @@ static long size_for_mapping(void) {
     return -1;
   }
   return page_size_bytes * 2;
+}
+
+static uint64_t time_now_ns(void) {
+  struct timespec ts;
+  if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
+    return 0;
+  }
+  return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
 // The process context is designed to be read by an outside-of-process reader. Thus, for concurrency purposes the steps
@@ -159,9 +166,16 @@ otel_process_ctx_result otel_process_ctx_publish(const otel_process_ctx_data *da
 
   // Step: Populate the mapping
   // The payload and any extra fields must come first and not be reordered with the signature by the compiler.
+
+  uint64_t published_at_ns = time_now_ns();
+  if (published_at_ns == 0) {
+    return (otel_process_ctx_result) {.success = false, .error_message = "Failed to get current time (" __FILE__ ":" ADD_QUOTES(__LINE__) ")"};
+  }
+
   *published_state.mapping = (otel_process_ctx_mapping) {
     .otel_process_ctx_signature = {0}, // Set in "Step: Populate the signature into the mapping" below
     .otel_process_ctx_version = 2,
+    .otel_process_ctx_published_at_ns = published_at_ns,
     .otel_process_payload_size = payload_size,
     .otel_process_payload = published_state.payload
   };

@@ -73,7 +73,7 @@ echo "Start address: $start_addr"
 
 # Read struct otel_process_ctx_mapping, encode as base64 so we can safely store it in a shell variable.
 # (Bash variables cannot hold NUL bytes, so raw binary causes issues)
-data_b64="$(dd if="/proc/$pid/mem" bs=1 count=24 skip=$((16#$start_addr)) status=none | base64 -w0)"
+data_b64="$(dd if="/proc/$pid/mem" bs=1 count=32 skip=$((16#$start_addr)) status=none | base64 -w0)"
 
 # Pretty-print otel_process_ctx_mapping
 printf '%s' "$data_b64" | base64 -d | hexdump -C
@@ -88,18 +88,25 @@ signature="$(
 version="$(
   printf '%s' "$data_b64" | base64 -d | dd bs=1 skip=8 count=4 status=none | od -An -t u4 | tr -d ' '
 )"
+published_at_ns="$(
+  printf '%s' "$data_b64" | base64 -d | dd bs=1 skip=12 count=8 status=none | od -An -t u8 | tr -d ' '
+)"
 payload_size="$(
-  printf '%s' "$data_b64" | base64 -d | dd bs=1 skip=12 count=4 status=none | od -An -t u4 | tr -d ' '
+  printf '%s' "$data_b64" | base64 -d | dd bs=1 skip=20 count=4 status=none | od -An -t u4 | tr -d ' '
 )"
 payload_ptr_hex="$(
-  printf '%s' "$data_b64" | base64 -d | dd bs=1 skip=16 count=8 status=none | od -An -t x8 | tr -d ' '
+  printf '%s' "$data_b64" | base64 -d | dd bs=1 skip=24 count=8 status=none | od -An -t x8 | tr -d ' '
 )"
 
 echo "Parsed struct:"
-echo "  otel_process_ctx_signature : \"$signature\""
-echo "  otel_process_ctx_version   : $version"
-echo "  otel_process_payload_size  : $payload_size"
-echo "  otel_process_payload       : 0x$payload_ptr_hex"
+echo "  otel_process_ctx_signature       : \"$signature\""
+echo "  otel_process_ctx_version         : $version"
+# Convert nanoseconds to seconds for date command
+published_at_s=$((published_at_ns / 1000000000))
+published_at_pretty="$(date -d "@$published_at_s" '+%Y-%m-%d %H:%M:%S %Z')"
+echo "  otel_process_ctx_published_at_ns : $published_at_ns ($published_at_pretty)"
+echo "  otel_process_payload_size        : $payload_size"
+echo "  otel_process_payload             : 0x$payload_ptr_hex"
 
 echo "Payload dump ($payload_size bytes):"
 dd if="/proc/$pid/mem" bs=1 count="$payload_size" skip=$((16#$payload_ptr_hex)) status=none | hexdump -C
