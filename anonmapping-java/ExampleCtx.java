@@ -266,7 +266,7 @@ class OtelProcessCtx {
             // The signature must come last and not be reordered with the fields above by the compiler. After this step, external readers
             // can read the signature and know that the payload is ready to be read.
             MemorySegment signatureSegment = globalArena.allocateFrom(OTEL_CTX_SIGNATURE);
-            mapping.copyFrom(signatureSegment);
+            MemorySegment.copy(signatureSegment, 0, mapping, 0, 8);
             // TODO: Should we somehow clean up `signatureSegment`?
 
                 // Step: Change permissions on the mapping to only read permission
