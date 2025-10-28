@@ -113,7 +113,7 @@ dd if="/proc/$pid/mem" bs=1 count="$payload_size" skip=$((16#$payload_ptr_hex)) 
 
 if command -v protoc >/dev/null 2>&1; then
   echo "Protobuf decode:"
-  dd if="/proc/$pid/mem" bs=1 count="$payload_size" skip=$((16#$payload_ptr_hex)) status=none | protoc --decode=otel_process_ctx.OtelProcessCtx otel_process_ctx.proto
+  dd if="/proc/$pid/mem" bs=1 count="$payload_size" skip=$((16#$payload_ptr_hex)) status=none | protoc --decode=otel_process_ctx.v1development.OtelProcessCtx otel_process_ctx.proto
 else
   echo
   echo "protoc not available - skipping protobuf decode"
