@@ -12,6 +12,8 @@ Specifically:
 
 * `anonmapping-java` is a proof of concept port of `anonmapping-clib` to pure Java, without any dependencies.
 
+* `otel-java-extension-demo` provides a small Java test app + an OTEL Java SDK extension so that an app instrumented using the SDK can publish the process context automatically. It's based on `anonmapping-java`.
+
 * `anonmapping-clib-msgpack` provides an earlier version of the reference C implementation for publishing the process-level data using msgpack as a payload:
     * (This version is otherwise the same as the protobuf-based version)
     * There's also a pure-go port of this code in https://github.com/DataDog/dd-trace-go/pull/3937
