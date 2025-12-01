@@ -84,8 +84,6 @@ typedef struct __attribute__((packed, aligned(8))) {
 /**
  * The full state of a published process context.
  *
- * This is returned as an opaque type to the caller.
- *
  * It is used to store the all data for the process context and that needs to be kept around while the context is published.
  */
 typedef struct {
@@ -117,9 +115,7 @@ static long size_for_mapping(void) {
 
 static uint64_t time_now_ns(void) {
   struct timespec ts;
-  if (clock_gettime(CLOCK_REALTIME, &ts) == -1) {
-    return 0;
-  }
+  if (clock_gettime(CLOCK_REALTIME, &ts) == -1) return 0;
   return ts.tv_sec * 1000000000ULL + ts.tv_nsec;
 }
 
@@ -225,17 +221,19 @@ bool otel_process_ctx_drop_current(void) {
   published_state = (otel_process_ctx_state) {.publisher_pid = 0, .mapping = NULL, .payload = NULL};
   atomic_thread_fence(memory_order_seq_cst);
 
+  bool success = true;
+
   // The mapping only exists if it was created by the current process; if it was inherited by a fork it doesn't exist anymore
   // (due to the MADV_DONTFORK) and we don't need to do anything to it.
   if (state.mapping != NULL && state.mapping != MAP_FAILED && getpid() == state.publisher_pid) {
     long mapping_size = size_for_mapping();
-    if (mapping_size == -1 || munmap(state.mapping, mapping_size) == -1) return false;
+    success = mapping_size > 0 && munmap(state.mapping, mapping_size) == 0;
   }
 
   // The payload may have been inherited from a parent. This is a regular malloc so we need to free it so we don't leak.
-  if (state.payload) free(state.payload);
+  free(state.payload);
 
-  return true;
+  return success;
 }
 
 // The caller is responsible for enforcing that value fits within UINT14_MAX
@@ -317,9 +315,6 @@ static void write_attribute(char **ptr, const char *key, const char *value) {
   write_protobuf_string(ptr, value);
 }
 
-// TODO: The serialization format is still under discussion and is not considered stable yet.
-// Comments **very** welcome.
-//
 // Encode the payload as protobuf bytes.
 //
 // This method implements an extremely compact but limited protobuf encoder for the Resource message.
@@ -448,7 +443,7 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
 
   // Helper function to read a protobuf varint (limited to 1-2 bytes, max value UINT14_MAX, matching write_protobuf_varint above)
   static bool read_protobuf_varint(char **ptr, char *end_ptr, uint16_t *value) {
-    if (*ptr >= end_ptr) return false; // Out of bounds
+    if (*ptr >= end_ptr) return false;
 
     unsigned char first_byte = (unsigned char)**ptr;
     (*ptr)++;
@@ -457,7 +452,7 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
       *value = first_byte;
       return true;
     } else {
-      if (*ptr >= end_ptr) return false; // Out of bounds
+      if (*ptr >= end_ptr) return false;
       unsigned char second_byte = (unsigned char)**ptr;
       (*ptr)++;
 
@@ -466,40 +461,34 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
     }
   }
 
-  // Helper function to read a protobuf string, within the same limits as the encoder imposes
-  static bool read_protobuf_string(char **ptr, char *end_ptr, char **out_string) {
+  // Helper function to read a protobuf string into a buffer, within the same limits as the encoder imposes
+  static bool read_protobuf_string(char **ptr, char *end_ptr, char *buffer) {
     uint16_t len;
-    if (!read_protobuf_varint(ptr, end_ptr, &len)) return false;
+    if (!read_protobuf_varint(ptr, end_ptr, &len) || len >= KEY_VALUE_LIMIT + 1 || *ptr + len > end_ptr) return false;
 
-    if (len > KEY_VALUE_LIMIT) return false; // Enforce same limit as encoder
-    if (*ptr + len > end_ptr) return false; // Check bounds
-
-    *out_string = (char *) calloc(len + 1, 1);
-    if (!*out_string) return false;
-
-    memcpy(*out_string, *ptr, len);
-    (*out_string)[len] = '\0';
+    memcpy(buffer, *ptr, len);
+    buffer[len] = '\0';
     *ptr += len;
 
     return true;
   }
 
   // Reads field name and validates the fixed LEN wire type
-  static bool read_protobuf_tag(char **ptr, char *end_ptr, uint8_t *field_number, uint8_t *wire_type) {
+  static bool read_protobuf_tag(char **ptr, char *end_ptr, uint8_t *field_number) {
     if (*ptr >= end_ptr) return false;
 
     unsigned char tag = (unsigned char)**ptr;
     (*ptr)++;
 
-    *wire_type = tag & 0x07;
+    uint8_t wire_type = tag & 0x07;
     *field_number = tag >> 3;
 
-    return *wire_type == 2; // We only need the LEN wire type for now
+    return wire_type == 2; // We only need the LEN wire type for now
   }
 
   // Simplified protobuf decoder to match the exact encoder above. If the protobuf data doesn't match the encoder, this will
   // return false.
-  static bool otel_process_ctx_decode_payload(char *payload, uint32_t payload_size, otel_process_ctx_data *data_out) {
+  static bool otel_process_ctx_decode_payload(char *payload, uint32_t payload_size, otel_process_ctx_data *data_out, char *key_buffer, char *value_buffer) {
     char *ptr = payload;
     char *end_ptr = payload + payload_size;
 
@@ -507,76 +496,66 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
 
     size_t resource_index = 0;
     size_t resource_capacity = 201; // Allocate space for 100 pairs + NULL terminator entry
+    data_out->resources = (char **) calloc(resource_capacity, sizeof(char *));
+    if (data_out->resources == NULL) return false;
 
     while (ptr < end_ptr) {
-      uint8_t field_number, wire_type;
-      if (!read_protobuf_tag(&ptr, end_ptr, &field_number, &wire_type)) return false;
+      uint8_t field_number;
+      if (!read_protobuf_tag(&ptr, end_ptr, &field_number) || field_number != 1) return false;
 
-      // Handle resources field (field 1)
-      if (field_number == 1) {
-        if (!data_out->resources) {
-          data_out->resources = (char **) calloc(resource_capacity, sizeof(char *));
-          if (!data_out->resources) return false;
-        } else if (resource_index + 2 >= resource_capacity) {
-          return false;
+      uint16_t kv_len;
+      if (!read_protobuf_varint(&ptr, end_ptr, &kv_len)) return false;
+      char *kv_end = ptr + kv_len;
+      if (kv_end > end_ptr) return false;
+
+      bool key_found = false;
+      bool value_found = false;
+
+      // Parse KeyValue
+      while (ptr < kv_end) {
+        uint8_t kv_field;
+        if (!read_protobuf_tag(&ptr, kv_end, &kv_field)) return false;
+
+        if (kv_field == 1) { // KeyValue.key
+          if (!read_protobuf_string(&ptr, kv_end, key_buffer)) return false;
+          key_found = true;
+        } else if (kv_field == 2) { // KeyValue.value (AnyValue)
+          uint16_t _any_len; // Unused, but we still need to consume + validate the varint
+          if (!read_protobuf_varint(&ptr, kv_end, &_any_len)) return false;
+          uint8_t any_field;
+          if (!read_protobuf_tag(&ptr, kv_end, &any_field)) return false;
+
+          if (any_field == 1) { // AnyValue.string_value
+            if (!read_protobuf_string(&ptr, kv_end, value_buffer)) return false;
+            value_found = true;
+          }
         }
-
-        uint16_t resource_len;
-        if (!read_protobuf_varint(&ptr, end_ptr, &resource_len)) return false;
-        char *resource_ptr = ptr;
-        char *resource_end = ptr + resource_len;
-
-        if (resource_end > end_ptr) return false; // Invalid length
-
-        // Parse the resource submessage (assuming key-value pairs in order)
-        uint8_t sub_field_number, sub_wire_type;
-        // Read key (field 1)
-        char *key;
-        if (
-            !read_protobuf_tag(&resource_ptr, resource_end, &sub_field_number, &sub_wire_type) ||
-            sub_field_number != 1 ||
-            !read_protobuf_string(&resource_ptr, resource_end, &key)) {
-          return false;
-        }
-        data_out->resources[resource_index++] = key;
-
-        // Read value (field 2)
-        char *value;
-        if (!read_protobuf_tag(&resource_ptr, resource_end, &sub_field_number, &sub_wire_type) ||
-            sub_field_number != 2 ||
-            !read_protobuf_string(&resource_ptr, resource_end, &value)) {
-          return false;
-        }
-        data_out->resources[resource_index++] = value;
-
-        ptr = resource_end; // Move past this resource
-        continue;
       }
 
-      // Handle fixed fields
-      if (field_number >= 2 && field_number <= 9) {
-        char *value;
-        if (!read_protobuf_string(&ptr, end_ptr, &value)) return false;
+      if (!key_found || !value_found) return false;
 
-        char **field_ptr = NULL;
-        switch (field_number) {
-          case 2: field_ptr = &data_out->deployment_environment_name; break;
-          case 3: field_ptr = &data_out->service_instance_id; break;
-          case 4: field_ptr = &data_out->service_name; break;
-          case 5: field_ptr = &data_out->service_version; break;
-          case 6: field_ptr = &data_out->telemetry_sdk_language; break;
-          case 7: field_ptr = &data_out->telemetry_sdk_version; break;
-          case 8: field_ptr = &data_out->telemetry_sdk_name; break;
-        }
+      char *value = strdup(value_buffer);
+      if (!value) return false;
 
-        if (field_ptr == NULL || *field_ptr != NULL) {
+      // Dispatch based on key
+      if (strcmp(key_buffer, "deployment.environment.name") == 0) { data_out->deployment_environment_name = value; }
+      else if (strcmp(key_buffer, "service.instance.id") == 0) { data_out->service_instance_id = value; }
+      else if (strcmp(key_buffer, "service.name") == 0) { data_out->service_name = value; }
+      else if (strcmp(key_buffer, "service.version") == 0) { data_out->service_version = value; }
+      else if (strcmp(key_buffer, "telemetry.sdk.language") == 0) { data_out->telemetry_sdk_language = value; }
+      else if (strcmp(key_buffer, "telemetry.sdk.version") == 0) { data_out->telemetry_sdk_version = value; }
+      else if (strcmp(key_buffer, "telemetry.sdk.name") == 0) { data_out->telemetry_sdk_name = value; }
+      else {
+        char *key = strdup(key_buffer);
+
+        if (!key || resource_index + 2 >= resource_capacity) {
+          free(key);
           free(value);
           return false;
         }
-
-        *field_ptr = value;
-      } else {
-        return false;
+        data_out->resources[resource_index] = key;
+        data_out->resources[resource_index + 1] = value;
+        resource_index += 2;
       }
     }
 
@@ -616,7 +595,19 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
 
     otel_process_ctx_data data = empty_data;
 
-    if (!otel_process_ctx_decode_payload(mapping->otel_process_payload, mapping->otel_process_payload_size, &data)) {
+    char *key_buffer = (char *) calloc(KEY_VALUE_LIMIT + 1, 1);
+    char *value_buffer = (char *) calloc(KEY_VALUE_LIMIT + 1, 1);
+    if (!key_buffer || !value_buffer) {
+        free(key_buffer);
+        free(value_buffer);
+        return (otel_process_ctx_read_result) {.success = false, .error_message = "Failed to allocate decode buffers (" __FILE__ ":" ADD_QUOTES(__LINE__) ")", .data = empty_data};
+    }
+
+    bool success = otel_process_ctx_decode_payload(mapping->otel_process_payload, mapping->otel_process_payload_size, &data, key_buffer, value_buffer);
+    free(key_buffer);
+    free(value_buffer);
+
+    if (!success) {
       otel_process_ctx_read_data_drop(data);
       return (otel_process_ctx_read_result) {.success = false, .error_message = "Failed to decode payload (" __FILE__ ":" ADD_QUOTES(__LINE__) ")", .data = empty_data};
     }
@@ -626,13 +617,8 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
 
   bool otel_process_ctx_read_drop(otel_process_ctx_read_result *result) {
     if (!result || !result->success) return false;
-
-    // Free allocated strings in the data
     otel_process_ctx_read_data_drop(result->data);
-
-    // Reset the result to empty state
     *result = (otel_process_ctx_read_result) {.success = false, .error_message = "Data dropped", .data = empty_data};
-
     return true;
   }
 #endif // OTEL_PROCESS_CTX_NO_READ
