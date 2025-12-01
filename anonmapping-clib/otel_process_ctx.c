@@ -244,10 +244,16 @@ static size_t protobuf_varint_size(uint16_t value) { return value >= 128 ? 2 : 1
 // Field tag for record + varint len + data
 static size_t protobuf_record_size(size_t len) { return 1 + protobuf_varint_size(len) + len; }
 
-static size_t protobuf_string_size(char *str) { return protobuf_record_size(strlen(str)); }
+static size_t protobuf_string_size(const char *str) { return protobuf_record_size(strlen(str)); }
+
+static size_t protobuf_otel_keyvalue_string_size(const char *key, const char *value) {
+  size_t key_field_size = protobuf_string_size(key);                           // String
+  size_t value_field_size = protobuf_record_size(protobuf_string_size(value)); // Nested AnyValue message with a string inside
+  return key_field_size + value_field_size; // Does not include the keyvalue record tag + size, only its payload
+}
 
 // As a simplification, we enforce that keys and values are <= 4096 (KEY_VALUE_LIMIT) so that their size + extra bytes always fits within UINT14_MAX
-static otel_process_ctx_result validate_and_calculate_protobuf_payload_size(size_t *out_pairs_size, char **pairs, bool fixed_key_fields) {
+static otel_process_ctx_result validate_and_calculate_protobuf_payload_size(size_t *out_pairs_size, char **pairs) {
   size_t num_entries = 0;
   for (size_t i = 0; pairs[i] != NULL; i++) num_entries++;
   if (num_entries % 2 != 0) {
@@ -256,21 +262,17 @@ static otel_process_ctx_result validate_and_calculate_protobuf_payload_size(size
 
   *out_pairs_size = 0;
   for (size_t i = 0; pairs[i * 2] != NULL; i++) {
-    size_t key_len = strlen(pairs[i * 2]);
-    if (key_len > KEY_VALUE_LIMIT) {
+    char *key = pairs[i * 2];
+    char *value = pairs[i * 2 + 1];
+
+    if (strlen(key) > KEY_VALUE_LIMIT) {
       return (otel_process_ctx_result) {.success = false, .error_message = "Length of key in otel_process_ctx_data exceeds 4096 limit (" __FILE__ ":" ADD_QUOTES(__LINE__) ")"};
     }
-    size_t value_len = strlen(pairs[i * 2 + 1]);
-    if (value_len > KEY_VALUE_LIMIT) {
+    if (strlen(value) > KEY_VALUE_LIMIT) {
       return (otel_process_ctx_result) {.success = false, .error_message = "Length of value in otel_process_ctx_data exceeds 4096 limit (" __FILE__ ":" ADD_QUOTES(__LINE__) ")"};
     }
-    size_t pair_size = protobuf_record_size(value_len);
-    if (!fixed_key_fields) {
-      pair_size += protobuf_record_size(key_len);
-      pair_size += 1 + protobuf_varint_size(pair_size); // Field tag for record (1) + varint len (1 or 2)
-    }
 
-    *out_pairs_size += pair_size;
+    *out_pairs_size += protobuf_record_size(protobuf_otel_keyvalue_string_size(key, value)); // KeyValue message
   }
   return (otel_process_ctx_result) {.success = true, .error_message = NULL};
 }
@@ -300,12 +302,28 @@ static void write_protobuf_tag(char **ptr, uint8_t field_number) {
   *(*ptr)++ = (char)((field_number << 3) | 2); // Field type is always 2 (LEN)
 }
 
+static void write_attribute(char **ptr, const char *key, const char *value) {
+  write_protobuf_tag(ptr, 1); // Resource.attributes (field 1)
+  write_protobuf_varint(ptr, protobuf_otel_keyvalue_string_size(key, value));
+
+  // KeyValue
+  write_protobuf_tag(ptr, 1); // KeyValue.key (field 1)
+  write_protobuf_string(ptr, key);
+  write_protobuf_tag(ptr, 2); // KeyValue.value (field 2)
+  write_protobuf_varint(ptr, protobuf_string_size(value));
+
+  // AnyValue
+  write_protobuf_tag(ptr, 1); // AnyValue.string_value (field 1)
+  write_protobuf_string(ptr, value);
+}
+
 // TODO: The serialization format is still under discussion and is not considered stable yet.
 // Comments **very** welcome.
 //
 // Encode the payload as protobuf bytes.
 //
-// This method implements an extremely compact but limited protobuf encoder for the otel_process_ctx.proto message.
+// This method implements an extremely compact but limited protobuf encoder for the Resource message.
+// It encodes all fields as attributes (KeyValue pairs).
 // For extra compact code, it fixes strings at up to 4096 bytes.
 static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **out, uint32_t *out_size, otel_process_ctx_data data) {
   const char *pairs[] = {
@@ -320,12 +338,12 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
   };
 
   size_t pairs_size = 0;
-  otel_process_ctx_result validation_result = validate_and_calculate_protobuf_payload_size(&pairs_size, (char **) pairs, true);
+  otel_process_ctx_result validation_result = validate_and_calculate_protobuf_payload_size(&pairs_size, (char **) pairs);
   if (!validation_result.success) return validation_result;
 
   size_t resources_pairs_size = 0;
   if (data.resources != NULL) {
-    validation_result = validate_and_calculate_protobuf_payload_size(&resources_pairs_size, data.resources, false);
+    validation_result = validate_and_calculate_protobuf_payload_size(&resources_pairs_size, data.resources);
     if (!validation_result.success) return validation_result;
   }
 
@@ -338,21 +356,11 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
   char *ptr = encoded;
 
   for (size_t i = 0; pairs[i * 2] != NULL; i++) {
-    write_protobuf_tag(&ptr, i + 2); // Fixed fields are numbered from 2
-    write_protobuf_string(&ptr, pairs[i * 2 + 1]); // Write value
+    write_attribute(&ptr, pairs[i * 2], pairs[i * 2 + 1]);
   }
 
-  if (data.resources != NULL) {
-    for (size_t i = 0; data.resources[i * 2] != NULL; i++) {
-      char *key = data.resources[i * 2];
-      char *value = data.resources[i * 2 + 1];
-      write_protobuf_tag(&ptr, 1); // Resources field is field number 1
-      write_protobuf_varint(&ptr, protobuf_string_size(key) + protobuf_string_size(value));
-      write_protobuf_tag(&ptr, 1); // Key is field number 1 in the submessage
-      write_protobuf_string(&ptr, key);
-      write_protobuf_tag(&ptr, 2); // Value is field number 2 in the submessage
-      write_protobuf_string(&ptr,value);
-    }
+  for (size_t i = 0; data.resources != NULL && data.resources[i * 2] != NULL; i++) {
+    write_attribute(&ptr, data.resources[i * 2], data.resources[i * 2 + 1]);
   }
 
   *out = encoded;
