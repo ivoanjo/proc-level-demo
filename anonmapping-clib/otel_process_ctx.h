@@ -41,23 +41,23 @@ extern "C" {
  */
 typedef struct {
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/deployment/#deployment-environment-name
-  char *deployment_environment_name;
+  const char *deployment_environment_name;
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/service/#service-instance-id
-  char *service_instance_id;
+  const char *service_instance_id;
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/service/#service-name
-  char *service_name;
+  const char *service_name;
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/service/#service-version
-  char *service_version;
+  const char *service_version;
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/telemetry/#telemetry-sdk-language
-  char *telemetry_sdk_language;
+  const char *telemetry_sdk_language;
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/telemetry/#telemetry-sdk-version
-  char *telemetry_sdk_version;
+  const char *telemetry_sdk_version;
   // https://opentelemetry.io/docs/specs/semconv/registry/attributes/telemetry/#telemetry-sdk-name
-  char *telemetry_sdk_name;
+  const char *telemetry_sdk_name;
   // Additional key/value pairs as resources https://opentelemetry.io/docs/specs/otel/resource/sdk/
   // Can be NULL if no resources are needed; if non-NULL, this array MUST be terminated with a NULL entry.
   // Every even entry is a key, every odd entry is a value (E.g. "key1", "value1", "key2", "value2", NULL).
-  char **resources;
+  const char **resources;
 } otel_process_ctx_data;
 
 /** Number of entries in the `otel_process_ctx_data` struct. Can be used to easily detect when the struct is updated. */

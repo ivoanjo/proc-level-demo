@@ -72,7 +72,7 @@ bool read_and_print_ctx(const char* prefix) {
   return true;
 }
 
-char *resources[] = {
+const char *resources[] = {
   "resource.key1", "resource.value1",
   "resource.key2", "resource.value2",
   NULL

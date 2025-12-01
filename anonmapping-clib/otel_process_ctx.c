@@ -105,7 +105,7 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
 
 // We use a mapping size of 2 pages explicitly as a hint when running on legacy kernels that don't support the
 // PR_SET_VMA_ANON_NAME prctl call; see below for more details.
-static long size_for_mapping(void) {
+static ssize_t size_for_mapping(void) {
   long page_size_bytes = sysconf(_SC_PAGESIZE);
   if (page_size_bytes < 4096) {
     return -1;
@@ -129,7 +129,7 @@ otel_process_ctx_result otel_process_ctx_publish(const otel_process_ctx_data *da
   }
 
   // Step: Determine size for mapping
-  long mapping_size = size_for_mapping();
+  ssize_t mapping_size = size_for_mapping();
   if (mapping_size == -1) {
     return (otel_process_ctx_result) {.success = false, .error_message = "Failed to get page size (" __FILE__ ":" ADD_QUOTES(__LINE__) ")"};
   }
@@ -226,7 +226,7 @@ bool otel_process_ctx_drop_current(void) {
   // The mapping only exists if it was created by the current process; if it was inherited by a fork it doesn't exist anymore
   // (due to the MADV_DONTFORK) and we don't need to do anything to it.
   if (state.mapping != NULL && state.mapping != MAP_FAILED && getpid() == state.publisher_pid) {
-    long mapping_size = size_for_mapping();
+    ssize_t mapping_size = size_for_mapping();
     success = mapping_size > 0 && munmap(state.mapping, mapping_size) == 0;
   }
 
@@ -251,7 +251,7 @@ static size_t protobuf_otel_keyvalue_string_size(const char *key, const char *va
 }
 
 // As a simplification, we enforce that keys and values are <= 4096 (KEY_VALUE_LIMIT) so that their size + extra bytes always fits within UINT14_MAX
-static otel_process_ctx_result validate_and_calculate_protobuf_payload_size(size_t *out_pairs_size, char **pairs) {
+static otel_process_ctx_result validate_and_calculate_protobuf_payload_size(size_t *out_pairs_size, const char **pairs) {
   size_t num_entries = 0;
   for (size_t i = 0; pairs[i] != NULL; i++) num_entries++;
   if (num_entries % 2 != 0) {
@@ -260,8 +260,8 @@ static otel_process_ctx_result validate_and_calculate_protobuf_payload_size(size
 
   *out_pairs_size = 0;
   for (size_t i = 0; pairs[i * 2] != NULL; i++) {
-    char *key = pairs[i * 2];
-    char *value = pairs[i * 2 + 1];
+    const char *key = pairs[i * 2];
+    const char *value = pairs[i * 2 + 1];
 
     if (strlen(key) > KEY_VALUE_LIMIT) {
       return (otel_process_ctx_result) {.success = false, .error_message = "Length of key in otel_process_ctx_data exceeds 4096 limit (" __FILE__ ":" ADD_QUOTES(__LINE__) ")"};
@@ -333,7 +333,7 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
   };
 
   size_t pairs_size = 0;
-  otel_process_ctx_result validation_result = validate_and_calculate_protobuf_payload_size(&pairs_size, (char **) pairs);
+  otel_process_ctx_result validation_result = validate_and_calculate_protobuf_payload_size(&pairs_size, (const char **) pairs);
   if (!validation_result.success) return validation_result;
 
   size_t resources_pairs_size = 0;
@@ -496,7 +496,7 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
 
     size_t resource_index = 0;
     size_t resource_capacity = 201; // Allocate space for 100 pairs + NULL terminator entry
-    data_out->resources = (char **) calloc(resource_capacity, sizeof(char *));
+    data_out->resources = (const char **) calloc(resource_capacity, sizeof(char *));
     if (data_out->resources == NULL) return false;
 
     while (ptr < end_ptr) {
@@ -570,16 +570,16 @@ static otel_process_ctx_result otel_process_ctx_encode_protobuf_payload(char **o
   }
 
   void otel_process_ctx_read_data_drop(otel_process_ctx_data data) {
-    if (data.deployment_environment_name) free(data.deployment_environment_name);
-    if (data.service_instance_id) free(data.service_instance_id);
-    if (data.service_name) free(data.service_name);
-    if (data.service_version) free(data.service_version);
-    if (data.telemetry_sdk_language) free(data.telemetry_sdk_language);
-    if (data.telemetry_sdk_version) free(data.telemetry_sdk_version);
-    if (data.telemetry_sdk_name) free(data.telemetry_sdk_name);
+    if (data.deployment_environment_name) free((void *)data.deployment_environment_name);
+    if (data.service_instance_id) free((void *)data.service_instance_id);
+    if (data.service_name) free((void *)data.service_name);
+    if (data.service_version) free((void *)data.service_version);
+    if (data.telemetry_sdk_language) free((void *)data.telemetry_sdk_language);
+    if (data.telemetry_sdk_version) free((void *)data.telemetry_sdk_version);
+    if (data.telemetry_sdk_name) free((void *)data.telemetry_sdk_name);
     if (data.resources) {
-      for (int i = 0; data.resources[i] != NULL; i++) free(data.resources[i]);
-      free(data.resources);
+      for (int i = 0; data.resources[i] != NULL; i++) free((void *)data.resources[i]);
+      free((void *)data.resources);
     }
   }
 
