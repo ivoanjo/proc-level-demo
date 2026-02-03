@@ -43,44 +43,91 @@ $ java -Dotel.javaagent.extensions=../otel-process-ctx-extension/build/libs/open
 ```
 Picked up JAVA_TOOL_OPTIONS: -javaagent:opentelemetry-javaagent.jar
 OpenJDK 64-Bit Server VM warning: Sharing is only supported for boot loader classes because bootstrap classpath has been appended
-[otel.javaagent 2025-10-28 16:17:38:511 +0000] [main] INFO io.opentelemetry.javaagent.tooling.VersionLogger - opentelemetry-javaagent - version: 2.21.0
+[otel.javaagent 2026-02-03 15:29:04:822 +0000] [main] INFO io.opentelemetry.javaagent.tooling.VersionLogger - opentelemetry-javaagent - version: 2.21.0
 WARNING: A restricted method in java.lang.foreign.Linker has been called
 WARNING: java.lang.foreign.Linker::downcallHandle has been called by com.example.javaagent.OtelProcessCtx in an unnamed module
 WARNING: Use --enable-native-access=ALL-UNNAMED to avoid a warning for callers in this module
 WARNING: Restricted methods will be blocked in a future release unless native access is enabled
 
 Published OTEL_CTX
-2025-10-28T16:17:41.322Z INFO 'Starting DiceApplication using Java 23.0.1 with PID 398219 (dice-application.jar started by ivo.anjo)' : 00000000000000000000000000000000 0000000000000000 [scopeInfo: otel.DiceApplication:] {}
+2026-02-03T15:29:08.077Z INFO 'Starting DiceApplication using Java 23.0.1 with PID 148671 (/home/ivo.anjo/datadog/ctx-sharing/proc-level-demo/otel-java-extension-demo/dice-application/build/libs/dice-application.jar started by ivo.anjo in /home/ivo.anjo/datadog/ctx-sharing/proc-level-demo/otel-java-extension-demo/dice-application)' : 00000000000000000000000000000000 0000000000000000 [scopeInfo: otel.DiceApplication:] {}
 ```
 
-5. You can now take the PID and use the `otel_process_ctx_dump.sh` from the `anonmapping-clib` folder to print the application context:
+5. You can now take the PID and use the `otel_process_ctx_dump.sh` from https://github.com/open-telemetry/sig-profiling/tree/main/process-context/c-and-cpp folder to print the application context:
 
 ```
-$ sudo ./otel_process_ctx_dump.sh 398219
-Found OTEL context for PID 398219
-Start address: 75e620025000
-00000000  4f 54 45 4c 5f 43 54 58  02 00 00 00 07 f2 73 e5  |OTEL_CTX......s.|
-00000010  86 b5 72 18 59 00 00 00  b0 40 73 1c e6 75 00 00  |..r.Y....@s..u..|
+$ sudo ./otel_process_ctx_dump.sh 148671
+Found OTEL context for PID 148671
+Start address: 7b2f4c342000
+00000000  4f 54 45 4c 5f 43 54 58  02 00 00 00 09 01 00 00  |OTEL_CTX........|
+00000010  18 ae b8 fd 2b c6 90 18  c0 72 79 44 2f 7b 00 00  |....+....ryD/{..|
 00000020
 Parsed struct:
   otel_process_ctx_signature       : "OTEL_CTX"
   otel_process_ctx_version         : 2
-  otel_process_ctx_published_at_ns : 1761669995235111431 (2025-10-28 16:46:35 GMT)
-  otel_process_payload_size        : 89
-  otel_process_payload             : 0x000075e61c7340b0
-Payload dump (89 bytes):
-00000000  12 00 1a 24 39 66 66 33  63 62 31 64 2d 39 62 33  |...$9ff3cb1d-9b3|
-00000010  65 2d 34 31 33 33 2d 62  38 34 32 2d 66 39 61 37  |e-4133-b842-f9a7|
-00000020  31 62 37 32 61 39 61 63  22 10 64 69 63 65 2d 61  |1b72a9ac".dice-a|
-00000030  70 70 6c 69 63 61 74 69  6f 6e 2a 00 32 04 6a 61  |pplication*.2.ja|
-00000040  76 61 3a 06 31 2e 35 35  2e 30 42 0d 6f 70 65 6e  |va:.1.55.0B.open|
-00000050  74 65 6c 65 6d 65 74 72  79                       |telemetry|
-00000059
+  otel_process_payload_size        : 265
+  otel_process_ctx_published_at_ns : 1770132545799237144 (2026-02-03 15:29:05 GMT)
+  otel_process_payload             : 0x00007b2f447972c0
+Payload dump (265 bytes):
+00000000  0a 21 0a 1b 64 65 70 6c  6f 79 6d 65 6e 74 2e 65  |.!..deployment.e|
+00000010  6e 76 69 72 6f 6e 6d 65  6e 74 2e 6e 61 6d 65 12  |nvironment.name.|
+00000020  02 0a 00 0a 3d 0a 13 73  65 72 76 69 63 65 2e 69  |....=..service.i|
+00000030  6e 73 74 61 6e 63 65 2e  69 64 12 26 0a 24 31 61  |nstance.id.&.$1a|
+00000040  63 61 32 64 62 39 2d 38  34 34 61 2d 34 30 32 35  |ca2db9-844a-4025|
+00000050  2d 38 66 63 30 2d 36 36  36 63 38 37 66 63 61 38  |-8fc0-666c87fca8|
+00000060  35 61 0a 22 0a 0c 73 65  72 76 69 63 65 2e 6e 61  |5a."..service.na|
+00000070  6d 65 12 12 0a 10 64 69  63 65 2d 61 70 70 6c 69  |me....dice-appli|
+00000080  63 61 74 69 6f 6e 0a 15  0a 0f 73 65 72 76 69 63  |cation....servic|
+00000090  65 2e 76 65 72 73 69 6f  6e 12 02 0a 00 0a 20 0a  |e.version..... .|
+000000a0  16 74 65 6c 65 6d 65 74  72 79 2e 73 64 6b 2e 6c  |.telemetry.sdk.l|
+000000b0  61 6e 67 75 61 67 65 12  06 0a 04 6a 61 76 61 0a  |anguage....java.|
+000000c0  21 0a 15 74 65 6c 65 6d  65 74 72 79 2e 73 64 6b  |!..telemetry.sdk|
+000000d0  2e 76 65 72 73 69 6f 6e  12 08 0a 06 31 2e 35 35  |.version....1.55|
+000000e0  2e 30 0a 25 0a 12 74 65  6c 65 6d 65 74 72 79 2e  |.0.%..telemetry.|
+000000f0  73 64 6b 2e 6e 61 6d 65  12 0f 0a 0d 6f 70 65 6e  |sdk.name....open|
+00000100  74 65 6c 65 6d 65 74 72  79                       |telemetry|
+00000109
 Protobuf decode:
-service_instance_id: "9ff3cb1d-9b3e-4133-b842-f9a71b72a9ac"
-service_name: "dice-application"
-telemetry_sdk_language: "java"
-telemetry_sdk_version: "1.55.0"
-telemetry_sdk_name: "opentelemetry"
-
+attributes {
+  key: "deployment.environment.name"
+  value {
+    string_value: ""
+  }
+}
+attributes {
+  key: "service.instance.id"
+  value {
+    string_value: "1aca2db9-844a-4025-8fc0-666c87fca85a"
+  }
+}
+attributes {
+  key: "service.name"
+  value {
+    string_value: "dice-application"
+  }
+}
+attributes {
+  key: "service.version"
+  value {
+    string_value: ""
+  }
+}
+attributes {
+  key: "telemetry.sdk.language"
+  value {
+    string_value: "java"
+  }
+}
+attributes {
+  key: "telemetry.sdk.version"
+  value {
+    string_value: "1.55.0"
+  }
+}
+attributes {
+  key: "telemetry.sdk.name"
+  value {
+    string_value: "opentelemetry"
+  }
+}
 ```

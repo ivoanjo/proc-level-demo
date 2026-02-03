@@ -16,7 +16,8 @@ import static java.lang.foreign.ValueLayout.*;
  * It's not yet intended to be used in production, but to show off how in a few hundred lines of Java code we can:
  * * Setup the process mapping in pure Java code (using the new Java FFM API -- requires Java 22+)
  *   (TODO: Have not tried running it with preview versions of FFM that shipped with Java as far back as 19; maybe it works?)
- * * Emit the process context payload in protobof without any additional dependencies.
+ * * Emit the process context payload in protobof without any additional dependencies. In production we'll most likely want to use
+ *   an actual protobuf encoder.
  */
 
  class OtelProcessCtx {
@@ -32,6 +33,9 @@ import static java.lang.foreign.ValueLayout.*;
   private static final int MADV_DONTFORK = 0x10;
   private static final int PR_SET_VMA = 0x53564d41;
   private static final int PR_SET_VMA_ANON_NAME = 0;
+  private static final int MFD_CLOEXEC = 0x0001;
+  private static final int MFD_ALLOW_SEALING = 0x0002;
+  private static final int MFD_NOEXEC_SEAL = 0x0008;
 
   private static final Linker LINKER = Linker.nativeLinker();
   private static final SymbolLookup LIBC = LINKER.defaultLookup();
@@ -39,9 +43,11 @@ import static java.lang.foreign.ValueLayout.*;
   private static final MethodHandle MMAP;
   private static final MethodHandle MUNMAP;
   private static final MethodHandle MADVISE;
-  private static final MethodHandle MPROTECT;
   private static final MethodHandle PRCTL;
-  private static final MethodHandle SYSCONF;
+  private static final MethodHandle MEMFD_CREATE;
+  private static final MethodHandle FTRUNCATE;
+  private static final MethodHandle CLOSE;
+  private static final MethodHandle GETPID;
 
   static {
       try {
@@ -57,27 +63,39 @@ import static java.lang.foreign.ValueLayout.*;
               LIBC.find("madvise").orElseThrow(),
               FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT)
           );
-          MPROTECT = LINKER.downcallHandle(
-              LIBC.find("mprotect").orElseThrow(),
-              FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_LONG, JAVA_INT)
-          );
           PRCTL = LINKER.downcallHandle(
               LIBC.find("prctl").orElseThrow(),
               FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_INT, ADDRESS, JAVA_LONG, ADDRESS)
           );
-          SYSCONF = LINKER.downcallHandle(
-              LIBC.find("sysconf").orElseThrow(),
-              FunctionDescriptor.of(JAVA_LONG, JAVA_INT)
+          MEMFD_CREATE = LINKER.downcallHandle(
+              LIBC.find("memfd_create").orElseThrow(),
+              FunctionDescriptor.of(JAVA_INT, ADDRESS, JAVA_INT)
+          );
+          FTRUNCATE = LINKER.downcallHandle(
+              LIBC.find("ftruncate").orElseThrow(),
+              FunctionDescriptor.of(JAVA_INT, JAVA_INT, JAVA_LONG)
+          );
+          CLOSE = LINKER.downcallHandle(
+              LIBC.find("close").orElseThrow(),
+              FunctionDescriptor.of(JAVA_INT, JAVA_INT)
+          );
+          GETPID = LINKER.downcallHandle(
+              LIBC.find("getpid").orElseThrow(),
+              FunctionDescriptor.of(JAVA_INT)
           );
       } catch (Throwable e) {
           throw new RuntimeException("Failed to initialize native method handles", e);
       }
   }
 
-  private static record PublishedState(MemorySegment mapping, long mappingSize) { }
+  private static record PublishedState(int publisherPid, MemorySegment mapping, MemorySegment payload) { }
 
   private static PublishedState publishedState = null;
   private static final Arena globalArena = Arena.global();
+
+  // Size of the otel_process_ctx_mapping struct:
+  // char[8] signature + uint32_t version + uint32_t size + uint64_t timestamp + char* pointer as uint64
+  private static final long MAPPING_SIZE = 8 + 4 + 4 + 8 + 8; // = 32 bytes
 
   private static int protobufVarintSize(int value) {
       return value >= 128 ? 2 : 1;
@@ -89,6 +107,12 @@ import static java.lang.foreign.ValueLayout.*;
 
   private static int protobufStringSize(String str) {
       return protobufRecordSize(str.getBytes(StandardCharsets.UTF_8).length);
+  }
+
+  private static int protobufOtelKeyvalueStringSize(String key, String value) {
+      int keyFieldSize = protobufStringSize(key);                           // String
+      int valueFieldSize = protobufRecordSize(protobufStringSize(value));   // Nested AnyValue message with a string inside
+      return keyFieldSize + valueFieldSize; // Does not include the keyvalue record tag + size, only its payload
   }
 
   private static void writeProtobufVarint(byte[] buffer, int[] offset, int value) {
@@ -112,37 +136,58 @@ import static java.lang.foreign.ValueLayout.*;
       buffer[offset[0]++] = (byte) ((fieldNumber << 3) | 2); // Field type is always 2 (LEN)
   }
 
+  private static void writeAttribute(byte[] buffer, int[] offset, String key, String value) {
+      writeProtobufTag(buffer, offset, 1); // Resource.attributes (field 1)
+      writeProtobufVarint(buffer, offset, protobufOtelKeyvalueStringSize(key, value));
+
+      // KeyValue
+      writeProtobufTag(buffer, offset, 1); // KeyValue.key (field 1)
+      writeProtobufString(buffer, offset, key);
+      writeProtobufTag(buffer, offset, 2); // KeyValue.value (field 2)
+      writeProtobufVarint(buffer, offset, protobufStringSize(value));
+
+      // AnyValue
+      writeProtobufTag(buffer, offset, 1); // AnyValue.string_value (field 1)
+      writeProtobufString(buffer, offset, value);
+  }
+
   private static String validateString(String str) {
-      if (str == null || protobufStringSize(str) > KEY_VALUE_LIMIT) {
-          throw new IllegalArgumentException("Invalid string");
+      if (str == null) {
+          throw new IllegalArgumentException("String cannot be null");
+      }
+      if (str.length() > KEY_VALUE_LIMIT) {
+          throw new IllegalArgumentException("String exceeds KEY_VALUE_LIMIT");
       }
       return str;
   }
 
   private static byte[] encodeProtobufPayload(Data data) {
-      String[] fixedFields = {
-          data.deploymentEnvironmentName,
-          data.serviceInstanceId,
-          data.serviceName,
-          data.serviceVersion,
-          data.telemetrySdkLanguage,
-          data.telemetrySdkVersion,
-          data.telemetrySdkName
+      // Build pairs array with keys and values
+      String[][] pairs = {
+          {"deployment.environment.name", data.deploymentEnvironmentName},
+          {"service.instance.id", data.serviceInstanceId},
+          {"service.name", data.serviceName},
+          {"service.version", data.serviceVersion},
+          {"telemetry.sdk.language", data.telemetrySdkLanguage},
+          {"telemetry.sdk.version", data.telemetrySdkVersion},
+          {"telemetry.sdk.name", data.telemetrySdkName}
       };
 
+      // Validate and calculate size for fixed pairs
       int pairsSize = 0;
-      for (String field : fixedFields) {
-          validateString(field);
-          pairsSize += protobufStringSize(field);
+      for (String[] pair : pairs) {
+          validateString(pair[0]);
+          validateString(pair[1]);
+          pairsSize += protobufRecordSize(protobufOtelKeyvalueStringSize(pair[0], pair[1]));
       }
 
+      // Validate and calculate size for resource pairs
       int resourcesSize = 0;
       if (data.resources != null) {
           for (Map.Entry<String, String> entry : data.resources.entrySet()) {
               String key = validateString(entry.getKey());
               String value = validateString(entry.getValue());
-              int pairSize = protobufStringSize(key) + protobufStringSize(value);
-              resourcesSize += pairSize + 1 + protobufVarintSize(pairSize);
+              resourcesSize += protobufRecordSize(protobufOtelKeyvalueStringSize(key, value));
           }
       }
 
@@ -150,24 +195,15 @@ import static java.lang.foreign.ValueLayout.*;
       byte[] encoded = new byte[totalSize];
       int[] offset = {0};
 
-      // Write fixed fields (numbered from 2)
-      for (int i = 0; i < fixedFields.length; i++) {
-          writeProtobufTag(encoded, offset, i + 2);
-          writeProtobufString(encoded, offset, fixedFields[i]);
+      // Write all fixed fields as attributes
+      for (String[] pair : pairs) {
+          writeAttribute(encoded, offset, pair[0], pair[1]);
       }
 
-      // Write resources (field number 1)
+      // Write all resource fields as attributes
       if (data.resources != null) {
           for (Map.Entry<String, String> entry : data.resources.entrySet()) {
-              String key = entry.getKey();
-              String value = entry.getValue();
-
-              writeProtobufTag(encoded, offset, 1); // Resources field is field number 1
-              writeProtobufVarint(encoded, offset, protobufStringSize(key) + protobufStringSize(value));
-              writeProtobufTag(encoded, offset, 1); // Key is field number 1 in the submessage
-              writeProtobufString(encoded, offset, key);
-              writeProtobufTag(encoded, offset, 2); // Value is field number 2 in the submessage
-              writeProtobufString(encoded, offset, value);
+              writeAttribute(encoded, offset, entry.getKey(), entry.getValue());
           }
       }
 
@@ -195,24 +231,39 @@ import static java.lang.foreign.ValueLayout.*;
       }
   }
 
+  private static boolean ctxIsPublished(PublishedState state) {
+      try {
+          return state != null && state.mapping != null &&
+                 state.mapping.address() != -1L &&
+                 state.publisherPid == (Integer) GETPID.invoke();
+      } catch (Throwable e) {
+          return false;
+      }
+  }
+
   // The process context is designed to be read by an outside-of-process reader. Thus, for concurrency purposes the steps
   // on this method are ordered in a way to avoid races, or if not possible to avoid, to allow the reader to detect if there was a race.
   public static Result publish(Data data) {
       if (data == null) return Result.withError("Data cannot be null");
 
       try {
-          // Step: Drop any previous context it if it exists
+          // Get current time in nanoseconds since epoch
+          Instant now = Instant.now();
+          long publishedAtNs = now.getEpochSecond() * 1_000_000_000L + now.getNano();
+          if (publishedAtNs == 0) {
+              return Result.withError("Failed to get current time");
+          }
+
+          // Step: If the context has been published by this process, update it in place
+          if (ctxIsPublished(publishedState)) {
+              return update(publishedAtNs, data);
+          }
+
+          // Step: Drop any previous context state if it exists
           // No state should be around anywhere after this step.
           if (!dropCurrent()) {
               return Result.withError("Failed to drop previous context");
           }
-
-          // Step: Determine size for mapping (2 pages)
-          long pageSize = (Long) SYSCONF.invoke(30); // _SC_PAGESIZE
-          if (pageSize < 4096) {
-              return Result.withError("Failed to get page size");
-          }
-          long mappingSize = pageSize * 2;
 
           // Step: Prepare the payload to be published
           // The payload SHOULD be ready and valid before trying to actually create the mapping.
@@ -220,49 +271,72 @@ import static java.lang.foreign.ValueLayout.*;
           // Store the encoded payload in global arena
           MemorySegment payloadSegment = globalArena.allocate(payloadResult.length);
           payloadSegment.copyFrom(MemorySegment.ofArray(payloadResult));
-          // TODO: We should make sure to drop `payloadSegment` when the mapping gets dropped
 
           // Step: Create the mapping
-          MemorySegment mapping = ((MemorySegment) MMAP.invoke(
-              MemorySegment.NULL,           // addr
-              mappingSize,                  // length
-              PROT_READ | PROT_WRITE,       // prot
-              MAP_PRIVATE | MAP_ANONYMOUS,  // flags
-              -1,                           // fd
-              0                             // offset
-          )).reinterpret(mappingSize);
+          int publisherPid = (Integer) GETPID.invoke();
+          MemorySegment mapping;
 
-          // Check if mmap failed - in C, MAP_FAILED is (void*)-1
-          if (mapping.address() == -1L) {
-              dropCurrent();
-              return Result.withError("Failed to allocate mapping");
+          // Try to create mapping from memfd
+          MemorySegment nameSegment = globalArena.allocateFrom(OTEL_CTX_SIGNATURE);
+          int fd = (Integer) MEMFD_CREATE.invoke(nameSegment, MFD_CLOEXEC | MFD_ALLOW_SEALING | MFD_NOEXEC_SEAL);
+          boolean failedToCloseFd = false;
+
+          if (fd >= 0) {
+              // Try to create mapping from memfd
+              if ((Integer) FTRUNCATE.invoke(fd, MAPPING_SIZE) == -1) {
+                  dropCurrent();
+                  return Result.withError("Failed to truncate memfd");
+              }
+              mapping = ((MemorySegment) MMAP.invoke(
+                  MemorySegment.NULL,           // addr
+                  MAPPING_SIZE,                 // length
+                  PROT_READ | PROT_WRITE,       // prot
+                  MAP_PRIVATE,                  // flags
+                  fd,                           // fd
+                  0L                            // offset
+              )).reinterpret(MAPPING_SIZE);
+              failedToCloseFd = ((Integer) CLOSE.invoke(fd) == -1);
+          } else {
+              // Fallback: Use an anonymous mapping instead
+              mapping = ((MemorySegment) MMAP.invoke(
+                  MemorySegment.NULL,           // addr
+                  MAPPING_SIZE,                 // length
+                  PROT_READ | PROT_WRITE,       // prot
+                  MAP_PRIVATE | MAP_ANONYMOUS,  // flags
+                  -1,                           // fd
+                  0L                            // offset
+              )).reinterpret(MAPPING_SIZE);
           }
 
-          publishedState = new PublishedState(mapping, mappingSize);
+          // Check if mmap failed - in C, MAP_FAILED is (void*)-1
+          if (mapping.address() == -1L || failedToCloseFd) {
+              dropCurrent();
+              if (failedToCloseFd) {
+                  return Result.withError("Failed to close memfd");
+              } else {
+                  return Result.withError("Failed to allocate mapping");
+              }
+          }
+
+          publishedState = new PublishedState(publisherPid, mapping, payloadSegment);
 
           // Step: Setup MADV_DONTFORK
           // This ensures that the mapping is not propagated to child processes (they should call update/publish again).
-          int madviseResult = (Integer) MADVISE.invoke(mapping, mappingSize, MADV_DONTFORK);
+          int madviseResult = (Integer) MADVISE.invoke(mapping, MAPPING_SIZE, MADV_DONTFORK);
           if (madviseResult == -1) {
               if (dropCurrent()) {
                   return Result.withError("Failed to setup MADV_DONTFORK");
               } else {
-                  return Result.withError("Failed to drop previous context");
+                  return Result.withError("Failed to drop context");
               }
           }
 
           // Step: Populate the mapping
           // The payload and any extra fields must come first and not be reordered with the signature by the compiler.
-
-          // Get current time in nanoseconds since epoch
-          Instant now = Instant.now();
-          long publishedAtNs = now.getEpochSecond() * 1_000_000_000L + now.getNano();
-
           mapping.set(ADDRESS, 0, MemorySegment.NULL); // signature placeholder
           mapping.set(JAVA_INT, 8, OTEL_CTX_VERSION);
-          // Use unaligned long since offset 12 is not 8-byte aligned (C struct is packed)
-          mapping.set(JAVA_LONG_UNALIGNED, 12, publishedAtNs);
-          mapping.set(JAVA_INT, 20, payloadResult.length);
+          mapping.set(JAVA_INT, 12, payloadResult.length);
+          mapping.set(JAVA_LONG, 16, publishedAtNs);
           mapping.set(ADDRESS, 24, payloadSegment);
 
           // Step: Synchronization - Mapping has been filled and is missing signature
@@ -275,38 +349,26 @@ import static java.lang.foreign.ValueLayout.*;
           // can read the signature and know that the payload is ready to be read.
           MemorySegment signatureSegment = globalArena.allocateFrom(OTEL_CTX_SIGNATURE);
           MemorySegment.copy(signatureSegment, 0, mapping, 0, 8);
-          // TODO: Should we somehow clean up `signatureSegment`?
 
-          // Step: Change permissions on the mapping to only read permission
-          // We've observed the combination of anonymous mapping + a given number of pages + read-only permission is not very common,
-          // so this is left as a hint for when running on older kernels and the naming the mapping feature below isn't available.
-          // For modern kernels, doing this is harmless so we do it unconditionally.
-          int mprotectResult = (Integer) MPROTECT.invoke(mapping, mappingSize, PROT_READ);
-          if (mprotectResult == -1) {
-              if (dropCurrent()) {
-                  return Result.withError("Failed to change permissions on mapping");
-              } else {
-                  return Result.withError("Failed to drop previous context");
-              }
-          }
-
-          // Step: Name the mapping so outside readers can:
+          // Step: Attempt to name the mapping so outside readers can:
           // * Find it by name
           // * Hook on prctl to detect when new mappings are published
-          //
-          // Naming an anonymous mapping is a Linux 5.17+ feature. On earlier versions, this method call can fail. Thus it's OK
-          // for this to fail because:
-          // 1. Things that hook on prctl are still able to see this call, even though it's not supported
-          // 2. As a fallback, on older kernels, it's possible to scan the mappings and look for the "OTEL_CTX" signature in the memory itself,
-          //    after observing the mapping has the expected number of pages and permissions.
-          MemorySegment nameSegment = globalArena.allocateFrom("OTEL_CTX");
+          MemorySegment nameSegment2 = globalArena.allocateFrom(OTEL_CTX_SIGNATURE);
           PRCTL.invoke(
               PR_SET_VMA,
               PR_SET_VMA_ANON_NAME,
               mapping,
-              mappingSize,
-              nameSegment
+              MAPPING_SIZE,
+              nameSegment2
           );
+          // Naming an anonymous mapping is an optional Linux 5.17+ feature (`CONFIG_ANON_VMA_NAME`).
+          // Many distros, such as Ubuntu and Arch enable it. On earlier kernel versions or kernels without the feature, this call can fail.
+          //
+          // It's OK for this to fail because (per-usecase):
+          // 1. "Find it by name" => As a fallback, it's possible to scan the mappings and for the memfd name.
+          // 2. "Hook on prctl" => When hooking on prctl via eBPF it's still possible to see this call, even when it's not supported/enabled.
+          //    This works even on older kernels! For this reason we unconditionally make this call even on older kernels -- to
+          //    still allow detection via hooking onto prctl.
 
           return Result.withSuccess();
       } catch (Throwable e) {
@@ -315,20 +377,81 @@ import static java.lang.foreign.ValueLayout.*;
       }
   }
 
+  private static Result update(long publishedAtNs, Data data) {
+      if (data == null || !ctxIsPublished(publishedState)) {
+          return Result.withError("Unexpected: data is null or context is not published");
+      }
+
+      try {
+          // Step: Prepare the new payload to be published
+          // The payload SHOULD be ready and valid before trying to actually update the mapping.
+          byte[] payloadResult = encodeProtobufPayload(data);
+          MemorySegment newPayloadSegment = globalArena.allocate(payloadResult.length);
+          newPayloadSegment.copyFrom(MemorySegment.ofArray(payloadResult));
+
+          MemorySegment mapping = publishedState.mapping;
+
+          // Step: Zero out published_at_ns in the mapping
+          // This enables readers to detect that an update is in-progress
+          mapping.set(JAVA_LONG, 16, 0L);
+
+          // Step: Synchronization - Make sure readers observe the zeroing above before anything else below
+          java.lang.invoke.VarHandle.fullFence();
+
+          // Step: Install updated data
+          mapping.set(JAVA_INT, 12, payloadResult.length);
+          mapping.set(ADDRESS, 24, newPayloadSegment);
+
+          // Step: Synchronization - Make sure readers observe the updated data before anything else below
+          java.lang.invoke.VarHandle.fullFence();
+
+          // Step: Install new published_at_ns
+          // The update is now complete -- readers that observe the new timestamp will observe the updated payload
+          mapping.set(JAVA_LONG, 16, publishedAtNs);
+
+          // Step: Attempt to name the mapping so outside readers can detect the update
+          MemorySegment nameSegment = globalArena.allocateFrom(OTEL_CTX_SIGNATURE);
+          PRCTL.invoke(
+              PR_SET_VMA,
+              PR_SET_VMA_ANON_NAME,
+              mapping,
+              MAPPING_SIZE,
+              nameSegment
+          );
+          // It's OK for this to fail -- see publish for why
+
+          // Step: Update bookkeeping
+          // The old payload segment is managed by the global arena, so we don't need to explicitly free it
+          publishedState = new PublishedState(publishedState.publisherPid, mapping, newPayloadSegment);
+
+          return Result.withSuccess();
+      } catch (Throwable e) {
+          return Result.withError("Exception during update: " + e.getMessage());
+      }
+  }
+
   public static boolean dropCurrent() {
       PublishedState state = publishedState;
-      publishedState = null;
 
-      // Unmap if mapping exists
-      if (state != null) {
+      // Zero out the state and make sure no operations below are reordered with zeroing
+      publishedState = null;
+      java.lang.invoke.VarHandle.fullFence();
+
+      boolean success = true;
+
+      // The mapping only exists if it was created by the current process; if it was inherited by a fork it doesn't exist anymore
+      // (due to the MADV_DONTFORK) and we don't need to do anything to it.
+      if (ctxIsPublished(state)) {
           try {
-              int munmapResult = (Integer) MUNMAP.invoke(state.mapping, state.mappingSize);
-              return munmapResult != -1;
+              int munmapResult = (Integer) MUNMAP.invoke(state.mapping, MAPPING_SIZE);
+              success = munmapResult != -1;
           } catch (Throwable e) {
-              return false;
+              success = false;
           }
       }
 
-      return true;
+      // The payload is managed by the global arena, so we don't need to explicitly free it
+
+      return success;
   }
 }
