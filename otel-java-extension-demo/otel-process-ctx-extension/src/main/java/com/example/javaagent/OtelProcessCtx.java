@@ -173,7 +173,7 @@ import static java.lang.foreign.ValueLayout.*;
           {"telemetry.sdk.name", data.telemetrySdkName}
       };
 
-      // Validate and calculate size for fixed pairs
+      // Validate and calculate size for fixed pairs (Resource.attributes)
       int pairsSize = 0;
       for (String[] pair : pairs) {
           validateString(pair[0]);
@@ -191,11 +191,17 @@ import static java.lang.foreign.ValueLayout.*;
           }
       }
 
-      int totalSize = pairsSize + resourcesSize;
+      int resourceSize = pairsSize + resourcesSize;
+      // ProcessContext wrapper: tag (1 byte) + resource length varint + resource content
+      int totalSize = 1 + protobufVarintSize(resourceSize) + resourceSize;
       byte[] encoded = new byte[totalSize];
       int[] offset = {0};
 
-      // Write all fixed fields as attributes
+      // ProcessContext.resource (field 1)
+      writeProtobufTag(encoded, offset, 1);
+      writeProtobufVarint(encoded, offset, resourceSize);
+
+      // Write all fixed fields as Resource attributes
       for (String[] pair : pairs) {
           writeAttribute(encoded, offset, pair[0], pair[1]);
       }
